@@ -5,26 +5,25 @@
 %% events
 %% globals
 HeatingDayMode
+HeatingDayAt
+HeatingNightAt
+HeatingDayTemp
+HeatingNightTemp
 --]]
--- Above is a control header for a Fibaro HC2 engine.
--- % properties - trigger the scene when a device property changed.
--- % globals - trigger the scene when a global variable value changed.
 
-local thermDeviceId = 197                 -- Id of the thermometer device
-local dayTempToKeep = 20                  -- Temp. to maintain when DAY mode 
-local nightTempToKeep = dayTempToKeep - 1 -- Temp. to maintain when NIGHT mode 
+local dayTempToKeep   = tonumber(fibaro:getGlobalValue("HeatingDayTemp"))
+local nightTempToKeep = tonumber(fibaro:getGlobalValue("HeatingNightTemp"))
+local temp     = tonumber(fibaro:getValue(197, "value")) -- Текущая температура в доме
+local hum      = tonumber(fibaro:getValue(198, "value")) -- Текущая влажность в доме
+local outTemp  = tonumber(fibaro:getValue(224, "value")) -- Температура на улице
+local outLight = tonumber(fibaro:getValue(225, "value")) -- Освещение на улице
+local dbHost   = "10.1.0.3:81" -- Адрес сервера БД
 
---
--- SendCommand: Send a command to controlled devices
---
-SendCommand = function(cmd)
-  fibaro:call(23, cmd); -- Pump: HOME
-  fibaro:call(25, cmd); -- Pump: HEAT. ACC.
+SendToPumps = function(cmd)
+  fibaro:call(23, cmd); -- Насос: ДОМ
+  fibaro:call(25, cmd); -- Насос: БАК
 end
 
---
--- Functions to write color text on the debug console
---
 Color = function(color, message)
   return string.format('<span style="color:%s;">%s</span>', color, message)
 end
@@ -49,43 +48,119 @@ Yellow = function(message)
   return Color('yellow', message)
 end
 
---
--- Debug: a shortcut to fibaro:debug(...) function
---
 Debug = function(message)
   fibaro:debug(message)
 end
 
 --
--- MAIN PROCEDURE
+-- SendStat: Отправка статистики на сервер БД
 --
--- Get current temp. from the declared thermometer...
-local temp = tonumber(fibaro:getValue(thermDeviceId, "value")) 
+SendStat = function(temperature, humidity, tempToMaintain, mode, command, outsideTemp, outsideLight)
+  local http = net.HTTPClient()
+  local payload = "/fibaro-stats/pumps_post.php" ..
+    "?temperature="    .. temperature ..
+    "&humidity="       .. humidity ..
+    "&tempToMaintain=" .. tempToMaintain ..
+    "&mode="           .. mode ..
+    "&command="        .. command ..
+  	"&outsideTemp="    .. outsideTemp ..
+  	"&outsideLight="    .. outsideLight
+  local url = "http://" .. dbHost .. payload
+  
+  Debug("Sending data...")
+  Debug(Gray(url))
+  
+  local httpClient = net.HTTPClient({timeout=5000})
+  httpClient:request(url, {
+      options = {
+          method = "GET"
+      },
+      success = function(resp)
+          local status = tonumber(resp.status)
+          if status == 200 then
+            Debug("Status: " .. Green(status))
+          else
+            Debug("Status: " .. Red(status))
+            Debug(Gray("--- Server response ---"))
+            Debug(Gray(resp.data))
+          end
+      end,
+      error = function(error)
+          Debug("error: " .. Red(error))
+      end
+    }
+  )
+end
 
--- Get current mode from the global variable HeatingDayMode...
-local heatingDayMode = (fibaro:getGlobalValue("HeatingDayMode") == "True")
+IsDayMode = function()
+  local currentHour = os.date('*t').hour -- Текущий час
+  currentHour = currentHour + tonumber(fibaro:getGlobalValue("HeatingTZShift")) -- Ручная коррекция времени 
+  
+  -- Сейчас день?
+  local isDay = 
+    (currentHour >= tonumber(fibaro:getGlobalValue("HeatingDayAt"))) and 
+    (currentHour <  tonumber(fibaro:getGlobalValue("HeatingNightAt")))
+  
+  -- Прочитаем сохранённые режимы...
+  local isDayAutoMode   = fibaro:getGlobalValue("HeatingDayAuto") == 'True' -- Это устанавливает программа
+  local isDayManualMode = fibaro:getGlobalValue("HeatingDayMode") == 'True' -- Это меняет человек
 
--- Save required temp. to the tempToKeep variable and report the current mode...
+  local strAutoMode = isDay and Yellow('DAY') or Blue('NIGHT')
+  
+  -- Начался новый период?
+  -- Запомним новый режим и сбросим ручной режим в текущее значение...
+  if (isDayAutoMode ~= isDay) then
+    Debug('Now is ' .. Yellow(currentHour) .. ' hours')
+    Debug('Switching mode to: ' .. strAutoMode)
+    
+    fibaro:setGlobal("HeatingDayAuto", isDay and 'True' or 'False')
+    fibaro:setGlobal("HeatingDayMode", isDay and 'True' or 'False')
+    
+    isDayManualMode = isDay
+  end
+  
+  local strManualMode = isDayManualMode and Yellow('DAY') or Blue('NIGHT')
+  Debug('Now is ' .. strAutoMode .. ', manual mode is ' .. strManualMode .. ' => mode is ' .. strManualMode)
+  
+  return isDayManualMode
+end
+    
+--
+-- Определим, какую температуру нужно поддерживать...
+--
 local tempToKeep
+local heatingDayMode = IsDayMode()
+local mode;
+
 if heatingDayMode then
   Debug('Mode: ' .. Yellow('DAY'))
+  mode = 'DAY'
   tempToKeep = dayTempToKeep
 else
   Debug('Mode: ' .. Blue('NIGHT'))
+  mode = 'NIGHT'
   tempToKeep = nightTempToKeep
 end
 
--- Report some info...
 Debug('Current temp: ' .. temp)
 Debug('Temp to maintain: ' .. tempToKeep)
 
--- Send on/off command to the controlled devices depending on the current temp...
+---
+-- Включаем или выключаем насосы...
+---
+local cmd = ""
 if temp < tempToKeep then
   Debug('Switching pumps ' .. Green('ON'))
-  SendCommand("turnOn");
-elseif temp > tempToKeep then
+  cmd = "turnOn"
+elseif temp >= tempToKeep then
   Debug('Switching pumps ' .. Red('OFF'))
-  SendCommand("turnOff");
+  cmd = "turnOff"
 end
+
+if cmd ~= "" then
+  SendToPumps(cmd)
+end
+
+SendStat(temp, hum, tempToKeep, mode, cmd, outTemp, outLight)
 
 Debug(Gray('---------------------'))
